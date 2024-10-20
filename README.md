@@ -1,11 +1,11 @@
 # Project Setup
 1. clone the repository
 ``` bash
-git clone git@github.com:praleshraya/recommendation_system.git
+git clone git@github.com:praleshraya/recommendation_system_api.git
 ```
 2. Go to project directory
 ```bash
-cd recommendation_system/api
+cd recommendation_system_api/api
 ```
 
 3. Create a virtual environment named ".venv"
