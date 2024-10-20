@@ -29,31 +29,41 @@ pip install -r requirements.txt
 # Database setup
 1. Install PostgreSQL db (if not installed in your system)
 
-2. Log in to PostgreSQL as the postgres User
+2. Starting DB server
+```bash
+sudo systemctl start postgresql
+```
+
+3. Stopping DB server
+```bash
+sudo systemctl stop postgresql
+```
+
+4. Log in to PostgreSQL as the postgres User
 ```bash
 sudo -i -u postgres
 psql
 ```
-3. Create a User
+5. Create a User
 ```sql
 CREATE USER user_name WITH PASSWORD 'password';
 ```
 
-4. Create Database
+6. Create Database
 ```sql
 CREATE DATABASE recommendation_system;
 ```
 
-5. Grant permission to newly created user to access the db
+7. Grant permission to newly created user to access the db
 ```sql
 GRANT ALL PRIVILEGES ON DATABASE recommendation_system TO user_name;
 ```
-6. To exit
+8. To exit
 ```sql
 \q
 ```
 
-7. Test db connection from newly created user and pw:
+9. Test db connection from newly created user and pw:
 ```bash
 psql -U user_name -d recommendation_system -h localhost -W
 ```
