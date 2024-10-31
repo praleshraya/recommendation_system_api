@@ -88,6 +88,9 @@ alembic revision --autogenerate -m "migration_file_name"
 1. Create .env file inside project directory. Refer to .env.example on what values to keep.
 
 2. Activate virtualenv
+```bash
+source venv/bin/activate
+```
 
 3. To run application:
 ```bash
