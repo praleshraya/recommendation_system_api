@@ -3,6 +3,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import text
 from sqlalchemy import event
 
+
 from src.sql_server import Base
 
 
@@ -14,6 +15,7 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     password = Column(String)
     role = Column(String, default="user")  # Default role is 'user', can be 'admin'
+    is_2fa_enabled = Column(Boolean, default=True)  # New column for 2FA
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
