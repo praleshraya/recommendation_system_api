@@ -1,7 +1,8 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, func, Float
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, func, Float, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import text
 from sqlalchemy import event
+
 
 from src.sql_server import Base
 
@@ -9,11 +10,12 @@ from src.sql_server import Base
 class User(Base):
     __tablename__ = "users"
 
-    user_id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     user_name = Column(String, index=True)
     email = Column(String, unique=True, index=True)
     password = Column(String)
     role = Column(String, default="user")  # Default role is 'user', can be 'admin'
+    is_2fa_enabled = Column(Boolean, default=True)  # New column for 2FA
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -25,7 +27,7 @@ class User(Base):
 class Movie(Base):
     __tablename__ = "movies"
 
-    movie_id = Column(Integer, primary_key=True, index=True)  # Primary Key
+    movie_id = Column(Integer, primary_key=True, autoincrement=True, index=True)  # Primary Key
     title = Column(String, index=True)  # Movie title
     genre = Column(String)  # Movie genre
     release_year = Column(Integer)  # Year of release
@@ -42,7 +44,7 @@ class Movie(Base):
 class Rating(Base):
     __tablename__ = "ratings"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     user_id = Column(Integer, ForeignKey("users.user_id"))
     movie_id = Column(Integer, ForeignKey("movies.movie_id"))
     rating = Column(Float)  # Rating can be a float value (e.g., 4.5 out of 5)
@@ -56,7 +58,7 @@ class Rating(Base):
 class UserMovie(Base):
     __tablename__ = "user_movies"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     user_id = Column(Integer, ForeignKey("users.user_id"))
     movie_id = Column(Integer, ForeignKey("movies.movie_id"))
     interaction_type = Column(String)  # e.g., 'watched', 'liked', 'favorited'
@@ -71,11 +73,12 @@ class UserMovie(Base):
 class Recommendation(Base):
     __tablename__ = "recommendations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
     user_id = Column(Integer, ForeignKey("users.user_id"))
     movie_id = Column(Integer, ForeignKey("movies.movie_id"))
     recommended_at = Column(DateTime(timezone=True), server_default=func.now())
     interacted = Column(Integer, default=0)  # Whether the user interacted with the recommendation (1 = yes, 0 = no)
+    active = Column(Boolean, default=True)  # New column
 
     # Relationships
     user = relationship("User")

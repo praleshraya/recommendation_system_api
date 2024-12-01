@@ -94,5 +94,5 @@ source venv/bin/activate
 
 3. To run application:
 ```bash
-uvicorn src.main:app --reload --port 8080
+uvicorn src.main:app --reload
 ```

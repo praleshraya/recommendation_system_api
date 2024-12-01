@@ -3,16 +3,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from datetime import datetime, timedelta, timezone
 from passlib.context import CryptContext
-from typing import List, Optional
+from sqlalchemy import desc, func, and_
 from sqlalchemy.orm import Session
+from typing import List, Optional
 from pydantic import BaseModel
+import random
+import redis
 import jwt
+import os
 
+from src.recommendation import collaborative_filtering_cosine
 from src.sql_server import get_db
+from src.utils import send_email
 from src.models import *
 
 
+
 app = FastAPI() # App initalize
+
+# Initialize Redis client
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST"),  # Use your Redis host, e.g., "127.0.0.1" or a cloud Redis instance
+    port=os.getenv("REDIS_PORT"),         # Default Redis port
+    db=0,              # Redis database index
+    decode_responses=True  # Ensures Redis returns strings instead of bytes
+)
 
 
 origins = [
@@ -77,30 +92,68 @@ def admin_required(current_user: User = Depends(get_current_user)):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
     return current_user
 
+
 # User and Movie Models (Pydantic)
 class UserCreate(BaseModel):
     user_name: str
     email: str
     password: str
+    role: Optional[str] = 'user'
+    is_2fa_enabled: Optional[bool] = True
 
 class UserLogin(BaseModel):
     email: str
     password: str
 
+class VerifyOTP(BaseModel):
+    email: str
+    otp: int
+
+class ResendOTP(BaseModel):
+    email: str
+
+class Clearredis_client(BaseModel):
+    email: str
+
+class UserResponse(BaseModel):
+    user_id: int
+    user_name: str
+    email: str
+    role: str  # Default role is 'user', can be 'admin'
+
 class Token(BaseModel):
     access_token: str
     token_type: str
+    user: UserResponse
     refresh_token: Optional[str] = None
 
 class MovieResponse(BaseModel):
+    movie_id: int
     title: str
-    genre: str
-    release_year: int
-    director: str
-    duration_min: int
-    poster: str
-    created_at: str
-    updated_at: str
+    genre: Optional[str] = None
+    release_year: Optional[int] = None
+    director: Optional[str] = None
+    duration_min: Optional[int] = None
+    poster: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    rating: Optional[int]
+
+    class Config:
+        orm_mode = True
+
+# Pydantic schema for User
+class UserSchema(BaseModel):
+    user_id: int
+    user_name: str
+    email: str
+    role: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+class MoviesResponse(BaseModel):
+    movies: List[MovieResponse]
+    total: int
 
 # Pydantic models for requests and responses
 class RatingCreate(BaseModel):
@@ -113,8 +166,8 @@ class RatingResponse(BaseModel):
     user_id: int
     movie_id: int
     rating: float
-    created_at: str
-    updated_at: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 # Pydantic models for adding/updating movies
 class MovieCreate(BaseModel):
@@ -145,34 +198,108 @@ def signup(user: UserCreate, db: Session = Depends(get_db)):
     new_user = User(
         user_name=user.user_name,
         email=user.email,
-        password=hash_password(user.password)
+        password=hash_password(user.password),
+        role = user.role
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     return {"message": "User created successfully", "user_id": new_user.user_id}
 
-# 2. User Login Endpoint
-@app.post("/login/")
-def login(user: UserLogin, db: Session = Depends(get_db)):
-    db_user = db.query(User).filter(User.email == user.email).first()
-    if not db_user or not verify_password(user.password, db_user.password):
-        raise HTTPException(status_code=400, detail="Invalid email or password")
-    
-    # Generate a token or return login success
-    return {"message": "Login successful", "user": db_user}
 
-@app.post("/token", response_model=Token)
+# 2. Login endpoint
+@app.post("/login")
 def login_for_access_token(user: UserLogin, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.email == user.email).first()
-    if not db_user or not verify_password(user.password, db_user.password):
-        raise HTTPException(status_code=400, detail="Invalid email or password")
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not verify_password(user.password, db_user.password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    # Check if 2FA is enabled
+    if not db_user.is_2fa_enabled:
+        return {"message": "Two-Factor Authentication (2FA) is not enabled. Please enable it to continue."}
+    
+    # Generate a 2FA OTP
+    otp = random.randint(100000, 999999)  # Example: 6-digit OTP
+    # Store the OTP (e.g., Redis or in-memory)
+    redis_client.set(f"otp:{db_user.email}", otp, ex=300)  # Store OTP for 5 minutes
 
-    access_token = create_access_token(data={"sub": db_user.email}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    refresh_token = create_refresh_token(data={"sub": db_user.email}, expires_delta=timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    # Send OTP via email
+    send_email(
+        to_email=db_user.email,
+        subject="Your 2FA OTP",
+        body=f"Your OTP is: {otp}. It expires in 5 minutes."
+    )
+    return {"message": "OTP sent to your email"}
+    
 
-    return {"access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token}
+@app.post("/resend-otp")
+def resend_otp(data: ResendOTP, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == data.email).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if 2FA is enabled
+    if not db_user.is_2fa_enabled:
+        return {"message": "Two-Factor Authentication (2FA) is not enabled. Please enable it to continue."}
+    
+    # Generate a 2FA OTP
+    otp = random.randint(100000, 999999)  # Example: 6-digit OTP
+    # Store the OTP (e.g., Redis or in-memory)
+    redis_client.set(f"otp:{db_user.email}", otp, ex=300)  # Store OTP for 5 minutes
 
+    # Send OTP via email
+    send_email(
+        to_email=db_user.email,
+        subject="Your 2FA OTP",
+        body=f"Your OTP is: {otp}. It expires in 5 minutes."
+    )
+    return {"message": "OTP resent to your email"}
+
+
+# End point to verify the OTP sent to user's email
+@app.post("/verify-otp")
+def verify_otp(data: VerifyOTP, db: Session = Depends(get_db)):
+    # Retrieve stored OTP
+    stored_otp = redis_client.get(f"otp:{data.email}")
+    if not stored_otp:
+        raise HTTPException(status_code=400, detail="OTP expired or invalid")
+    if int(stored_otp) != data.otp:
+        print(stored_otp)
+        raise HTTPException(status_code=401, detail="Invalid OTP")
+
+    # If OTP is valid, generate tokens
+    db_user = db.query(User).filter(User.email == data.email).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    access_token = create_access_token(data={"sub": data.email}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    refresh_token = create_refresh_token(data={"sub": data.email}, expires_delta=timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+
+    # Clear OTP after successful verification
+    redis_client.delete(f"otp:{data.email}")
+
+    user_data = UserResponse(
+        user_id=db_user.user_id,
+        user_name=db_user.user_name,
+        email=db_user.email,
+        role=db_user.role
+    )
+    return {"message": "User logged in successfully", "access_token": access_token, "token_type": "bearer", "refresh_token": refresh_token, "user": user_data}
+
+# End point to enable twi factor authentication
+@app.post("/enable-2fa")
+def enable_2fa(email: str, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == email).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db_user.is_2fa_enabled = True
+    db.commit()
+    return {"message": "Two-Factor Authentication (2FA) has been enabled for your account."}
+
+# 4. Refresh token endpoint
 @app.post("/refresh", response_model=Token)
 def refresh_token(refresh_token: str):
     try:
@@ -187,33 +314,154 @@ def refresh_token(refresh_token: str):
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-# # 3. Get Top 10 Movies for New Users
-# @app.get("/movies/recommendations/top10/", response_model=List[Movie])
-# def get_top_10_movies(db: Session = Depends(get_db)):
-#     top_movies = db.query(models.Movie).order_by(models.Movie.id).limit(10).all()
-#     return top_movies
+# 5. Get current user endpoint
+@app.get("/users/me", response_model=UserSchema)
+def get_user_me(current_user: User = Depends(get_current_user)):
+    # This function returns the current authenticated user details
+    return current_user
 
-# # 4. Get Similar Movies for Existing Users
-# @app.get("/movies/recommendations/similar/{user_id}/", response_model=List[Movie])
-# def get_similar_movies(user_id: int, db: Session = Depends(get_db)):
-#     # This is a placeholder for your recommendation logic
-#     similar_movies = db.query(models.Movie).order_by(models.Movie.id.desc()).limit(10).all()
-#     return similar_movies
+# 5. Get recommended movies for each user
+@app.get("/recommendations/{user_id}")
+def get_user_recommendations(user_id: int, db: Session = Depends(get_db)):
+    # Fetch active recommendations for the user with left join on Rating table
+    active_recommendations = (
+        db.query(Recommendation, Movie, Rating)
+        .join(Movie, Recommendation.movie_id == Movie.movie_id)
+        .outerjoin(Rating, and_(Rating.movie_id == Recommendation.movie_id, Rating.user_id == user_id))
+        .filter(Recommendation.user_id == user_id, Recommendation.active == True)
+        .limit(10)
+        .all()
+    )
 
-# 5. Search Movies by Title
+    # If active recommendations are found, return them
+    if active_recommendations:
+        recommendations = [
+            {"movie_id": rec.movie_id, "title": movie.title, "poster": movie.poster, "recommended_at": rec.recommended_at, "rating": rating.rating if rating else None}
+            for rec, movie, rating  in active_recommendations
+        ]
+        return {"recommendations": recommendations, "is_new_user": False}
+
+    # If no active recommendations, fetch top 10 highest-rated movies
+    top_movies = (
+        db.query(Movie)
+        .join(Rating, Rating.movie_id == Movie.movie_id)
+        .group_by(Movie.movie_id)
+        .order_by(desc(func.avg(Rating.rating)))
+        .limit(10)
+        .all()
+    )
+
+    # Prepare the fallback recommendations (top 10 movies)
+    fallback_recommendations = [
+        {"movie_id": movie.movie_id, "title": movie.title, "poster": movie.poster, "rating": db.query(func.avg(Rating.rating)).filter(Rating.movie_id == movie.movie_id).scalar()}
+        for movie in top_movies
+    ]
+    
+    return {"recommendations": fallback_recommendations, "is_new_user": True}
+
+# 7. Update recommendation for users
+@app.post("/recommendations/update")
+def update_recommendations(db: Session = Depends(get_db)):
+    # Retrieve all ratings from the database
+    ratings = db.query(Rating).all()
+    # Get recommendations using cosine similarity collaborative filtering
+    recommendations = collaborative_filtering_cosine(ratings)
+
+    for user_id, recommended_movies in recommendations.items():
+        # Retrieve the user's current active recommendations
+        current_recommendations = (
+            db.query(Recommendation)
+            .filter(Recommendation.user_id == user_id, Recommendation.active == True)
+            .order_by(Recommendation.recommended_at)
+            .all()
+        )
+
+        # Keep track of the number of new recommendations added
+        num_new_recommendations = 0
+
+        for movie_id in recommended_movies:
+            # Check if the movie is already recommended
+            if any(rec.movie_id == movie_id for rec in current_recommendations):
+                continue
+
+            # Add new recommendation
+            new_recommendation = Recommendation(
+                user_id=user_id,
+                movie_id=movie_id,
+                recommended_at=datetime.utcnow(),
+                interacted=0,
+                active=True
+            )
+            db.add(new_recommendation)
+            db.commit()
+            num_new_recommendations += 1
+
+            # If more than 20 recommendations, deactivate the oldest
+            if len(current_recommendations) + num_new_recommendations > 20:
+                oldest_recommendation = current_recommendations.pop(0)
+                oldest_recommendation.active = False
+                db.commit()
+
+    return {"message": "Recommendations updated successfully"}
+
+# 8. Search Movies by Title
 @app.get("/movies/search/", response_model=List[MovieResponse])
 def search_movies(query: str, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     searched_movies = db.query(Movie).filter(Movie.title.contains(query)).all()
     return searched_movies
 
-# 6. Get All Movies with Pagination
-@app.get("/movies/", response_model=List[MovieResponse])
-def get_movies(skip: int = 0, limit: int = 10, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
-    all_movies = db.query(Movie).offset(skip).limit(limit).all()
-    return all_movies
+# 9. Get All Movies with Pagination
+@app.get("/movies/", response_model=MoviesResponse)
+def read_movies(skip: int = 0, limit: int = 10, search: Optional[str] = None, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    # Query movies with average ratings
+    query = db.query(
+        Movie.movie_id,
+        Movie.title,
+        Movie.genre,
+        Movie.release_year,
+        Movie.director,
+        Movie.duration_min,
+        Movie.poster,
+        Movie.created_at,
+        Movie.updated_at,
+        func.avg(Rating.rating).label("average_rating")  # Calculate average rating
+    ).outerjoin(
+        Rating, Movie.movie_id == Rating.movie_id  # Left join movies with ratings
+    ).group_by(
+        Movie.movie_id  # Group by movie id to calculate average ratings
+    ).order_by(
+        Movie.title  # Optional: Order the result by movie title
+    )
 
-# 7. Add a new rating
-@app.post("/ratings/", response_model=RatingResponse)
+    # Apply search filter if provided
+    if search:
+        query = query.filter(Movie.title.ilike(f"%{search}%"))
+
+    # Get total count and paginated results
+    total = query.count()  # Total number of results
+    movies = query.offset(skip).limit(limit).all()  # Paginated results
+
+    # Format results to match the response model
+    formatted_movies = [
+        MovieResponse(
+            movie_id=movie.movie_id,
+            title=movie.title,
+            genre=movie.genre,
+            release_year=movie.release_year,
+            director=movie.director,
+            duration_min=movie.duration_min,
+            poster=movie.poster,
+            created_at=movie.created_at,
+            updated_at=movie.updated_at,
+            rating=movie.average_rating,  # Average rating or None
+        )
+        for movie in movies
+    ]
+
+    return {"movies": formatted_movies, "total": total}
+
+# 10. Add a new rating by user
+@app.post("/ratings", response_model=RatingResponse)
 def add_rating(rating: RatingCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     # Check if the user has already rated this movie
     existing_rating = db.query(Rating).filter(
@@ -235,7 +483,7 @@ def add_rating(rating: RatingCreate, db: Session = Depends(get_db), current_user
     db.refresh(new_rating)
     return new_rating
 
-# 8. Update an existing rating
+# 11. Update an existing rating
 @app.put("/ratings/{rating_id}", response_model=RatingResponse)
 def update_rating(rating_id: int, rating: RatingCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     # Find the rating by ID
@@ -249,19 +497,19 @@ def update_rating(rating_id: int, rating: RatingCreate, db: Session = Depends(ge
     db.refresh(db_rating)
     return db_rating
 
-# 9. Get all ratings for a specific movie
+# 12. Get all ratings for a specific movie
 @app.get("/movies/{movie_id}/ratings", response_model=List[RatingResponse])
 def get_movie_ratings(movie_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     ratings = db.query(Rating).filter(Rating.movie_id == movie_id).all()
     return ratings
 
-# 10. Get all ratings given by a specific user
+# 13. Get all ratings given by a specific user
 @app.get("/users/{user_id}/ratings", response_model=List[RatingResponse])
 def get_user_ratings(user_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
     ratings = db.query(Rating).filter(Rating.user_id == user_id).all()
     return ratings
 
-# 11. Add a new movie (Admin only)
+# 14. Add a new movie (Admin only)
 @app.post("/admin/movies/", dependencies=[Depends(admin_required)])
 def add_movie(movie: MovieCreate, db: Session = Depends(get_db)):
     new_movie = Movie(
@@ -277,7 +525,7 @@ def add_movie(movie: MovieCreate, db: Session = Depends(get_db)):
     db.refresh(new_movie)
     return new_movie
 
-# 12. Update an existing movie (Admin only)
+# 15. Update an existing movie (Admin only)
 @app.put("/admin/movies/{movie_id}", dependencies=[Depends(admin_required)])
 def update_movie(movie_id: int, movie: MovieUpdate, db: Session = Depends(get_db)):
     db_movie = db.query(Movie).filter(Movie.movie_id == movie_id).first()
@@ -302,7 +550,7 @@ def update_movie(movie_id: int, movie: MovieUpdate, db: Session = Depends(get_db
     db.refresh(db_movie)
     return db_movie
 
-# 13. Delete a movie (Admin only)
+# 16. Delete a movie (Admin only)
 @app.delete("/admin/movies/{movie_id}", dependencies=[Depends(admin_required)])
 def delete_movie(movie_id: int, db: Session = Depends(get_db)):
     db_movie = db.query(Movie).filter(Movie.movie_id == movie_id).first()
@@ -313,7 +561,7 @@ def delete_movie(movie_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Movie deleted successfully"}
 
-# 14. Delete a user (Admin only)
+# 17. Delete a user (Admin only)
 @app.delete("/admin/users/{user_id}", dependencies=[Depends(admin_required)])
 def delete_user(user_id: int, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.id == user_id).first()
@@ -323,3 +571,13 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
     db.delete(db_user)
     db.commit()
     return {"message": "User deleted successfully"}
+
+
+# 18. Get all users (Admin only)
+@app.get("/admin/users")
+def delete_user(db: Session = Depends(get_db)):
+    db_users = db.query(User).all()
+    if not db_users:
+        raise HTTPException(status_code=404, detail="No user found")
+    
+    return {"users": db_users}
